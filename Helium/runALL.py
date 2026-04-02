@@ -22,9 +22,9 @@ ureg.formatter.default_format = '~P'
 fluid         = 'Helium'
 dmach         = 18                               # design Mach number
 throat_radius = 0.5 * ureg.inch                  # throat radius [in]
-T0            = (500 * ureg.degK).to(ureg.degR)  # stagnation temperature
-P0            = (20e5 * ureg.pascal).to('psi')   # stagnation pressure
-T_wall        = 540   # [R]  wall temperature (no water cooling assumed)
+T0            = 500                              # stagnation temperature [Kelvin]
+P0            = 20e5                             # stagnation pressure [Pa]
+T_wall        = 300                              # wall temperature (no water cooling assumed) [K]
 
 # Contraction geometry
 pipe_width         = 6    # [in]  upstream pipe inner diameter
@@ -270,10 +270,10 @@ c["LR"] = -45   # throat characteristic points; negative prints transonic soluti
 c["NX"] = 18    # logarithmic upstream spacing         (Sivells example value)
 
 # Card 6 — stagnation and heat transfer
-c["PPQ"]  = P0.magnitude    # stagnation pressure [psia]
-c["TO"]   = T0.magnitude    # stagnation temperature [R]
-c["TWT"]  = T_wall          # wall temperature [R]
-c["TWAT"] = T_wall          # water-cooling temp [R]
+c["PPQ"]  = (P0 * ureg.pascal).to('psi').magnitude              # stagnation pressure [psia]
+c["TO"]   = (T0 * ureg.degK).to(ureg.degR).magnitude            # stagnation temperature [R]
+c["TWT"]  = (T_wall * ureg.degK).to(ureg.degR).magnitude        # wall temperature [R]
+c["TWAT"] = (T_wall * ureg.degK).to(ureg.degR).magnitude        # water-cooling temp [R]
 
 # Card 7 — interpolation output range
 c["XLOW"] = XLOW
