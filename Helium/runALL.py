@@ -1,317 +1,330 @@
+import os
+os.chdir(os.path.dirname(os.path.abspath(__file__)))
+
 import math
-from math import sqrt, comb # Python's built-in binomial coefficient  
+from math import comb
 import numpy as np
 from scipy.optimize import curve_fit
 import pint
+import CoolProp.CoolProp as cp
+from conturpy import ConturSettings, ConturApplication, save_all
+from prettytable import PrettyTable
+
 ureg = pint.UnitRegistry()
 ureg.default_system = 'imperial'
 ureg.formatter.default_format = '~P'
 
-import CoolProp.CoolProp as cp
-from conturpy import ConturSettings, ConturApplication
-# import warnings
-# warnings.filterwarnings("ignore")
-from prettytable import PrettyTable
-table = PrettyTable()
-import matplotlib.pyplot as plt
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  USER PARAMETERS  —  edit here, nothing below should need to change
+# ══════════════════════════════════════════════════════════════════════════════
+
+fluid         = 'Helium'
+dmach         = 18                               # design Mach number
+throat_radius = 0.5 * ureg.inch                  # throat radius [in]
+T0            = (500 * ureg.degK).to(ureg.degR)  # stagnation temperature
+P0            = (20e5 * ureg.pascal).to('psi')   # stagnation pressure
+T_wall        = 540   # [R]  wall temperature (no water cooling assumed)
+
+# Contraction geometry
+pipe_width         = 6    # [in]  upstream pipe inner diameter
+contraction_length = 10   # [in]  axial length of contraction section
+
+# Sutherland viscosity fit — temperature range [K] should span the nozzle flow
+T_fit_low  = 10
+T_fit_high = 500
+
+# Contur output interpolation range
+XLOW = 0      # [in]  start of interpolated contour
+XEND = 60     # [in]  end of interpolated contour (increase if nozzle is longer)
+XINC = 0.08   # [in]  interpolation increment
+
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+# ── Classes ───────────────────────────────────────────────────────────────────
 
 class State:
+    """
+    Thermodynamic state of a fluid computed via CoolProp.
+    Initialise with exactly two known properties, e.g. State('Helium', T=300, P=101325).
+    Supported keys: T [K], P [Pa], H [J/kg], S [J/kg·K], V [Pa·s], D [kg/m³],
+                    Cpmass, Cvmass [J/kg/K], gas_constant [J/mol/K],
+                    molarmass [kg/mol], Z [-], Prandtl [-]
+    """
+    _PROPS = ["T", "P", "H", "S", "V", "D",
+              "Cpmass", "Cvmass", "gas_constant", "molarmass", "Z", "Prandtl"]
+
     def __init__(self, fluid, **kwargs):
-        """
-        Initialize the thermodynamic state with exactly two properties.
-
-        Parameters:
-            fluid (str): The working fluid (e.g., 'Water', 'Air').
-            kwargs: Thermodynamic properties as keyword arguments.
-                Supported keys: 'T', 'P', 'H', 'S', 'Q', 'V'
-                Example: T=300, P=101325
-        """
         self.fluid = fluid
-        self.properties = {
-            "T": None,   # Temperature in K
-            "P": None,   # Pressure in Pa
-            "H": None,   # Mass Specific Enthalpy in J/kg
-            "S": None,   # Mass Specific Entropy in J/kg.K
-            "V": None,   # Dynamic Viscovity in Pa.s
-            "D": None,   # Density in kg/m^3
-            "Cpmass": None,         # Constant Pressure Specific Heat (mass based) in J/kg/K
-            "Cvmass": None,         # Constant Volume Specific Heat (mass based) in J/kg/K
-            "gas_constant": None,   # Molar Gas Constant in J/mol/K
-            "molarmass": None,      # Molar Mass in kg/mol
-            "Z": None,   #compressibility factor (dimensionless)
-            "Prandtl": None,        # Prandtl number (dimensionless)
-        }
+        self.properties = {k: None for k in self._PROPS}
 
+        provided = {k: v for k, v in kwargs.items() if k in self.properties}
+        if len(provided) != 2:
+            raise ValueError("Exactly two properties must be provided.")
+        self.properties.update(provided)
 
-        # Populate provided properties
-        provided_properties = {k: v for k, v in kwargs.items() if k in self.properties}
-        # Error handling to make sure every state is defined by at least 2 properties
-        if len(provided_properties) != 2:
-            raise ValueError("Exactly two properties must be provided to initialize the state.")
-
-        self.properties.update(provided_properties)
-
-        # Extract the provided property names and values
-        (prop1_name, prop1_value), (prop2_name, prop2_value) = provided_properties.items()
-
-        # Calculate missing properties
-        self._calculate_properties(prop1_name, prop1_value, prop2_name, prop2_value)
-
-        # Set class attributes for each property
+        (p1, v1), (p2, v2) = provided.items()
+        for prop in self._PROPS:
+            if self.properties[prop] is None:
+                try:
+                    self.properties[prop] = cp.PropsSI(prop, p1, v1, p2, v2, fluid)
+                except ValueError:
+                    self.properties[prop] = None
         for prop, value in self.properties.items():
             setattr(self, prop, value)
 
-
-    def _calculate_properties(self, prop1_name, prop1_value, prop2_name, prop2_value):
-        """
-        Calculate and fill in all missing thermodynamic properties using CoolProp.
-        """
-        # List of all properties for CoolProp
-        property_keys = list(self.properties.keys())
-
-        # Use CoolProp to calculate missing properties
-        for prop in property_keys:
-            if self.properties[prop] is None:
-                try:
-                    self.properties[prop] = cp.PropsSI(
-                        prop, prop1_name, prop1_value, prop2_name, prop2_value, self.fluid
-                    )
-                except ValueError:
-                    # Handle cases where the property cannot be calculated
-                    #print("ur fucked")########################################################################################
-                    self.properties[prop] = None
-
-
     def __repr__(self):
-        """
-        String representation of the thermodynamic state for print outs
-        """
-        return f"{self.properties}"
-# End State class
-# sutherlands law of viscocity curve fitting to NIST values
-def sutherlands(T, b, S): # modified sutherlands used by sevills in his code (p.64)
+        return f"State({self.fluid}, {self.properties})"
+
+
+# ── Functions ─────────────────────────────────────────────────────────────────
+
+def sutherlands(T, b, S):
+    """
+    Modified Sutherland viscosity law (Sivells p.64).
+    Above S:  mu = b * T^1.5 / (T + S)
+    Below S:  mu = b * T / (2*sqrt(S))   [linear approximation]
+    """
     T = np.asarray(T)
-
-    # allocate result array
     mu = np.zeros_like(T, dtype=float)
-
-    # region T > S
     mask = T > S
-    mu[mask] = b * (T[mask]**1.5) / (T[mask] + S)
-
-    # region T <= S
+    mu[mask]  = b * T[mask]**1.5 / (T[mask] + S)
     mu[~mask] = b * T[~mask] / (2 * np.sqrt(S))
-
     return mu
-
-def write_ansys_points(filename, arr, number, append=False):
-    mode = 'a' if append else 'w'
-    with open(filename, mode) as f:
-        for idx, (x, y) in enumerate(arr, start=1):
-            i = number
-            j = idx
-            z = 0.0
-            f.write(f"{x:.6f},{y:.6f},{z:.0f}\n")
-
-def write_SolidWorks_points(filename, arr, number, append=False):
-    mode = 'a' if append else 'w'
-    with open(filename, mode) as f:
-        for idx, (x, y) in enumerate(arr, start=1):
-            z = 0.0
-            f.write(f"{x:.6f}\t{y:.6f}\t{z:.0f}\n")
-
-c = ConturSettings()
-fluid = 'Helium'
-throat_radius = 0.15/2 * ureg.inch  # inches
-dmach = 18               # design mach
-print("Mach: ", dmach)
-# Chamber Properties
-T0  = (500*ureg.degK).to(ureg.degR) # 500 Kelvin converted to Rankine
-P0 = (20e5*ureg.pascal).to('psi') # 20 bar converted to psi
-print(T0, P0)
-
-# Average fluid properties
-P_He = 1.01325e5
-T_low = 10
-T_high = 500
-T_avg = (T_high + T_low)/2
-
-DataPoints = 600
-temps = np.linspace(T_low, T_high, num=DataPoints)
-viscocities = [State(fluid=fluid,T=T1,P=P_He).V for T1 in temps]
-results = curve_fit(sutherlands, xdata = temps, ydata = viscocities)[0]
-b_He,S_He = results[0], results[1]
-b_He_SI = b_He * (ureg.pascal * ureg.second / ureg.degK**0.5)  # Pa * s / K^1/2
-b_He_IMP = b_He_SI.to(ureg.lbf * ureg.second / (ureg.foot**2 * ureg.degR**0.5))
-S_He_SI = S_He * ureg.degK
-S_He_IMP = S_He_SI.to(ureg.degR)
-
-ref_State = State(fluid=fluid,T=T_avg,P=P_He) # reference state
-gamma = ref_State.Cpmass/ref_State.Cvmass
-R_gas_SI = ref_State.gas_constant/ref_State.molarmass * ureg.J/ureg.kg/ureg.K
-R_gas_IMP = R_gas_SI.to(ureg.ft**2 /(ureg.s**2 * ureg.degR))
-Z_gas = ref_State.Z
-TBLRF = (ref_State.Prandtl)**(1/3) # Turbulent boundary layer recovery factor
-table.field_names = ["Property", "Value", "Unit"]
-table.add_row(["Gamma", gamma, "Dimensionless"])
-table.add_divider()
-table.add_row(["Gas Constant", R_gas_IMP.magnitude, R_gas_IMP.units])
-table.add_divider()
-table.add_row(["Compressibility Factor", Z_gas, "Dimensionless"])
-table.add_divider()
-table.add_row(["Turbulent Boundary Layer Recovery Factor", TBLRF, "Dimensionless"])
-table.add_divider()
-table.add_row(["Sutherlands Constant", b_He_IMP.magnitude, b_He_IMP.units])
-table.add_divider()
-table.add_row(["Sutherlands Temperature", S_He_IMP.magnitude, S_He_IMP.units])
-print(table)
-
-
-# CARDS
-#Card 1: the title of the simulation
-c["ITLE"] = f"Mach {dmach}"
-c["JD"] = 0         # Axisymmetric or planar nozzle. Set to 0 for axisymmetric or -1 for planar nozzle.
-
-
-# Card 2 contains gas properties. As air is the assumed working fluid, no changes are required
-# All properties taken from sutherlands code
-c["GAM"] = gamma      # Ratio of specific heats.
-c["AR"] = R_gas_IMP.magnitude   # Gas constant in ft^2/sec^2 * R [or ft*lbf/(slug*R)]
-c["ZO"] = Z_gas         # Compressability factor for axisymmetric nozzle. Untested: half distance (in) between walls and assumed compressability factor of 1
-c["RO"] = TBLRF       # Turbulent boundary layer recovery factor (see Sivells' paper)
-# Sutherlands Law has a 25% error at 50K, 8.8% error at 100K, and 2% error 200-600K. The law is much more accurate at higher temperatures, which is bad since our nozzle continuously decreases the temperature
-c["VISC"]= b_He_IMP.magnitude  # b: Constant in viscosity law (see Sivells' paper) [in lbf * s / (ft^2 * R^1/2)]
-# VISC appears to be the sutherland constant as calculate by NACA on pg22 of Sivells
-c["VISM"] = S_He_IMP.magnitude    # S: Sutherland temperature in Rankine
-# VISM might be a lowerbound cutoff temperature for sutherland law instead: "Viscocity follows sutherlands law above VISM, but is linear with temperature below VISM" Sivells' paper pg64
-c["SFOA"] = 0         # If zero: 3rd or 4th degree velocity distribution depending on IX. If negative: absolute value is distance from throat to point G (see Sivells' paper). If positive: distance from throat to point A (see Sivells' paper).
-#c["XBL"] = 1000      # Where to start interpolating. If 1000, use spline fit to get evenly spaced points on wall contour.
-
-
-# Card 3: key design parameters
-c["ETAD"] = 60        # Angle at point D. Inflection angle for radial flow. If ETAD=60, the entire centerline velocity distribution is specified; IQ=1 and IX=0 on card 4.
-#print((0.5)/throat_radius * 6) # correction ratio for radius of curvature
-c["RC"] = (0.5/throat_radius*6).magnitude         # The radius of curvature of the throat: multiples of throat radius. [Suggest in the neighborhood of 5.5-6.0 for air]
-c["FMACH"] = 0        # If ETAD is not 60, Mach number at point F (see Sivells' paper)
-c["BMACH"] = 0        # If ETAD is not 60, Mach number at point B (see Sivells' paper)
-c["CMC"] = dmach      # The design mach number at point C (see Sivells' paper). This should be the design mach number of the nozzle. If ETAD is not 0, check Sivells' paper as this parameter is important.
-c["SF"] = throat_radius.magnitude # If positive, the nozzle has this as the throat radius (or half height) in inches. If 0, the nozzle has radius (or half height) 1 inch. If negative, the nozzle has this as the exit radius (or half height) in inches.
-#c["PP"] = 0          # Location of point A (see Sivells' paper). Strongly suggest setting to 0 (driven dimension) unless user is positive they want to specify location A.
-#c["XC"] = 0          # Nondimensional distance from radial source to point C (see Sivells' paper). Suggest 0 (4th degree velocity distribution).
-
-# # Card 4: 
-# c["MT"] = 81	    #Number of points on characteristic CD if ETAD=60 or EG if ETAD is not 60 (see Sivells' paper). Must be odd.
-# c["NT"] = 41	    # Number of points on axis IE (see Sivells' paper). Make sure abs(LR) + abs(NT) extless{}= 149. Must be odd.
-# c["IX"] = 0	# Unsure.
-# c["IN"] = 10	    # If nonzero, the downstream value of the second derivative of velocity at point B is 0.1 * IN times the transonic value if ETAD=60 or 0.1 * abs(IN) times the radial value if ETAD is not 60. Use 0 for throat only. Suggest 10.
-# c["IQ"] = 0	    # If ETAD is not 60, 0 for complete contour, 1 for throat only, and -1 for downstream only.
-# c["MD"] = 61	    # Number of points on characteristic AB (see Sivells' paper). No more than 125. Must be odd.
-# c["ND"] = 69	    # Number of points on axis BC (see Sivells' paper). No more than 150.
-# c["NF"] = -61	    # Number of points on characteristic CD if ETAD is not 60. See Sivells' paper if using.
-# c["MP"] = 0	    # Number of points on section GA (see Sivells' paper) if FMACH is not equal to BMACH. Sivells notes "Usually not known for initial calculation"
-# c["MQ"] = 0	    # Number of points downstream of point D if parallel contour desired. Negative to stop inviscid printout.
-# c["JB"] = 1	    # If positive: number of boundary layer calculations before spline fit. Negative impact is unknown, see Sivells' paper. Suggest 1.
-# c["JX"] = 0	    # Positive calculates streamlines. If XBL = 1000, spline fit after invisid calculation if JX=0 or repeat of calculation if negative. If XBL is not 1000, repeat calculations.
-# c["JC"] = 1	    # If not zero, print out inviscid characteristics for every JC characteristic. Positive for upstream and negative for downstream.
-# c["IT"] = 0	# Unsure.
-# c["LR"] = -25	    # Number of points on throat characteristic. Negative prints out transonic solution. If 0, M=1 at point I. See NT.
-# c["NX"] = 13	    # Logarithmic spacing for upstream contour. 10 is closer spacing and 20 is further spacing. Between 10 or 20. Suggest 13.
-
-# # Card 5: 
-# c["NOUP"] = 50	# Unsure.
-# c["NPCT"] = 85	# Unsure.
-# c["NODO"] = 50	# Unsure.
-
-
-# Card 6 (B): stagnation and heat transfer properties
-# 290 psi and 900R for Parziale
-c["PPQ"] = P0.magnitude      # Stagnation pressure [psia] (unkown breaking point) #120 starting
-c["TO"] = T0.magnitude      # Stagnation temperature [R] (breaks at 1219: investigate) #1000 starting
-c["TWT"] = 540      # Wall temperature [R]
-c["TWAT"] = 540     # Water-cooling temp [R] (suggest setting to TWT since water cooling not assumed)
-
-
-# Card 7 (D): interpolation parameters
-c["XLOW"] = 0       # Point to begin interpolating contour [in]
-c["XEND"] = 60      # Point to end interpolating contour [in]
-c["XINC"] = .08      # Increment to interpolate by [in]
-
-# Create the input text file and save it to 'm5.0.txt' in the folder 'inputcards'
-c.print_to_input(file_name=f'm{dmach:.1f}.txt', output_directory='inputcards')
-ca = ConturApplication()
-res = ca.batch_input_folder('inputcards', output_dir='outputs') # type: ignore
-#print(res[0].SuperBetterCoordinates)
-ExpansionCoords = res[0].SuperBetterCoordinates[1:]
-ExpansionCoords = np.concatenate(([[0,throat_radius.magnitude]], ExpansionCoords))
-
-
 
 
 def cubic_bezier(points, num=125):
     """
-    points: list or tuple of 4 control points P0, P1, P2, P3
-            each must be a length-2 iterable [x, y]
-    num: number of points evaluated along the curve
-    
-    Returns: (num x 2) array of curve points
+    Evaluate a cubic Bézier curve.
+    points : sequence of 4 control points [[x0,y0], ..., [x3,y3]]
+    num    : number of output points
+    Returns (num × 2) array.
     """
-    P0, P1, P2, P3 = [np.array(p, dtype=float) for p in points]
+    P0c, P1c, P2c, P3c = [np.array(p, dtype=float) for p in points]
     t = np.linspace(0, 1, num)
-
     curve = np.zeros((num, 2))
-    for i in range(4):
-        binom = comb(3, i)
-        curve += binom * ((1 - t)**(3 - i))[:, None] * (t**i)[:, None] * [P0, P1, P2, P3][i]
-
+    for i, Pi in enumerate([P0c, P1c, P2c, P3c]):
+        curve += comb(3, i) * ((1 - t)**(3 - i))[:, None] * (t**i)[:, None] * Pi
     return curve
 
-pipe_width = 6
-contraction_length = 10
-node1 = (-contraction_length, pipe_width/2)
-ctrl1 = (-contraction_length/2, node1[1])
 
-node2 = (0, throat_radius.magnitude)
-ctrl2 = (-contraction_length/2, node2[1])
-
-# Order: P0, P1, P2, P3
-points = [node1, ctrl1, ctrl2, node2]
-
-# Compute cubic Bézier points
-curve_points = cubic_bezier(points, num=125)
-
-
-
-
-def mass_flow(mach, radius = None, area = None):
-    if (radius is None) and (area is None):
-        raise ValueError("You must supply either radius or area.")
-    if (radius is not None) and (area is not None):
-        raise ValueError("Provide only one: radius OR area, not both.")
+def mass_flow(mach, radius=None, area=None):
+    """
+    Isentropic mass flow rate through a cross-section.
+    Requires either radius [in pint units] or area [in pint units²].
+    Uses module-level T0, P0, gamma, R_gas_IMP.
+    """
+    if (radius is None) == (area is None):
+        raise ValueError("Provide exactly one of: radius, area.")
     if radius is not None:
         area = math.pi * radius**2
+    return (
+        (area * P0 / T0**0.5)
+        * (gamma / R_gas_IMP)**0.5
+        * mach
+        * (1 + 0.5 * (gamma - 1) * mach**2) ** (-(gamma + 1) / (2 * (gamma - 1)))
+    ).to_base_units()
 
-    
-    return ((area*P0/(T0**(0.5))) * ((gamma/R_gas_IMP)**(0.5) *mach) * (1+0.5*(gamma-1)*mach**2)**(-(gamma+1)/(2*(gamma-1)))).to_base_units()
+
+def check_feasibility(T0_rankine, P0_psi, mach, gamma_val=5/3):
+    """
+    Prints warnings if operating conditions are outside feasible bounds.
+
+    Checks:
+      1. Fortran parser overflow — edge temperature at throat must be < 1000 R.
+         The BL output uses 7-char fixed-width fields; 4-digit temperatures
+         collide with adjacent columns and corrupt the output.
+      2. Helium condensation — exit static temperature must stay above
+         CoolProp saturation temperature at exit pressure, with a 2 K margin.
+    """
+    warnings_issued = False
+
+    # 1. Parser overflow
+    T_throat_R = float(T0_rankine) * (2 / (gamma_val + 1))
+    PARSER_LIMIT_R = 999.9
+    if T_throat_R >= PARSER_LIMIT_R:
+        T0_limit_R = PARSER_LIMIT_R / (2 / (gamma_val + 1))
+        print(f"\n  WARNING [parser overflow]: throat edge temp = {T_throat_R:.1f} R  "
+              f"(limit {PARSER_LIMIT_R:.0f} R).\n"
+              f"  Boundary-layer output will be corrupt. "
+              f"Keep T0 < {T0_limit_R:.0f} R  (~{T0_limit_R/1.8:.0f} K).")
+        warnings_issued = True
+
+    # 2. Condensation at nozzle exit (coldest point)
+    T0_K  = float(T0_rankine) / 1.8
+    P0_Pa = float(P0_psi) * 6894.76
+    iso   = 1 + (gamma_val - 1) / 2 * mach**2
+    T_exit_K  = T0_K  / iso
+    P_exit_Pa = P0_Pa / iso ** (gamma_val / (gamma_val - 1))
+    MARGIN_K = 2.0
+    try:
+        T_sat_K = cp.PropsSI('T', 'P', P_exit_Pa, 'Q', 0, 'Helium')
+        if T_exit_K < T_sat_K + MARGIN_K:
+            T0_min_K = (T_sat_K + MARGIN_K) * iso
+            print(f"\n  WARNING [condensation]: exit static temp = {T_exit_K:.2f} K  "
+                  f"(sat. temp = {T_sat_K:.2f} K at {P_exit_Pa:.2f} Pa).\n"
+                  f"  Helium may condense. "
+                  f"Increase T0 above {T0_min_K:.0f} K to keep a {MARGIN_K} K margin.")
+            warnings_issued = True
+    except Exception:
+        pass  # CoolProp may not have saturation data at very low pressures
+
+    if not warnings_issued:
+        print(f"  Feasibility OK:  T_throat = {T_throat_R:.1f} R  |  "
+              f"T_exit = {T_exit_K:.2f} K  (P_exit = {P_exit_Pa:.2f} Pa)")
 
 
+def write_ansys_points(filename, arr, append=False):
+    """Write nozzle boundary points in ANSYS point-cloud format (x,y,z)."""
+    mode = 'a' if append else 'w'
+    with open(filename, mode) as f:
+        for x, y in arr:
+            f.write(f"{x:.6f},{y:.6f},0\n")
 
-print("mass flow: ", mass_flow(radius=throat_radius,mach=1))
 
-file = 'AutoContour.txt'
+# ── Gas properties ────────────────────────────────────────────────────────────
 
-Inlet = [[-contraction_length,0],
-         [-contraction_length, pipe_width/2]]
-write_ansys_points(file, Inlet, number=1, append=False)
+print(f"Mach: {dmach}")
+print(f"T0 = {T0:.4f}   P0 = {P0:.4f}")
+check_feasibility(T0.magnitude, P0.magnitude, dmach)
 
-# Contraction Section
-write_ansys_points(file,curve_points, number=2,  append=True)
+# Sutherland viscosity fit to CoolProp data over [T_fit_low, T_fit_high] K
+P_ref  = 1.01325e5   # [Pa]  reference pressure for property lookup (1 atm)
+T_avg  = (T_fit_low + T_fit_high) / 2
+temps      = np.linspace(T_fit_low, T_fit_high, num=600)
+viscosities = [State(fluid=fluid, T=T1, P=P_ref).V for T1 in temps]
+(b_He, S_He), _ = curve_fit(sutherlands, xdata=temps, ydata=viscosities)
 
-# Expansion Section
-write_ansys_points(file,ExpansionCoords, number=3, append=True)
+b_He_SI  = b_He * (ureg.pascal * ureg.second / ureg.degK**0.5)
+b_He_IMP = b_He_SI.to(ureg.lbf * ureg.second / (ureg.foot**2 * ureg.degR**0.5))
+S_He_SI  = S_He * ureg.degK
+S_He_IMP = S_He_SI.to(ureg.degR)
+# Note: Sutherland's law has ~25% error below 50 K, ~9% at 100 K, ~2% above 200 K.
+# Helium in this nozzle reaches very low static temperatures, so BL viscosity
+# near the exit carries significant uncertainty.
 
-Outlet = [ExpansionCoords[-1],
-          [60,0]]
-write_ansys_points(file, Outlet, number=4, append=True)
+ref_state  = State(fluid=fluid, T=T_avg, P=P_ref)
+gamma      = ref_state.Cpmass / ref_state.Cvmass
+R_gas_SI   = ref_state.gas_constant / ref_state.molarmass * ureg.J / ureg.kg / ureg.K
+R_gas_IMP  = R_gas_SI.to(ureg.ft**2 / (ureg.s**2 * ureg.degR))
+Z_gas      = ref_state.Z
+TBLRF      = ref_state.Prandtl ** (1/3)  # turbulent BL recovery factor
 
-Symmetry = [Outlet[1],Inlet[0]]
-write_ansys_points(file, Symmetry, number=5, append=True)
+props_table = PrettyTable(["Property", "Value", "Unit"])
+for name, val, unit in [
+    ("Gamma",                                  gamma,             "Dimensionless"),
+    ("Gas Constant",                           R_gas_IMP.magnitude, str(R_gas_IMP.units)),
+    ("Compressibility Factor",                 Z_gas,             "Dimensionless"),
+    ("Turbulent BL Recovery Factor",           TBLRF,             "Dimensionless"),
+    ("Sutherland Constant  b",                 b_He_IMP.magnitude, str(b_He_IMP.units)),
+    ("Sutherland Temperature  S",              S_He_IMP.magnitude, str(S_He_IMP.units)),
+]:
+    props_table.add_row([name, val, unit])
+    props_table.add_divider()
+print(props_table)
+
+
+# ── Contur input cards ────────────────────────────────────────────────────────
+
+c = ConturSettings()
+
+# Card 1
+c["ITLE"] = f"Mach {dmach}"
+c["JD"]   = 0        # 0 = axisymmetric, -1 = planar
+
+# Card 2 — gas properties (derived above from CoolProp + Sutherland fit)
+c["GAM"]  = gamma
+c["AR"]   = R_gas_IMP.magnitude   # ft²/s²/R
+c["ZO"]   = Z_gas
+c["RO"]   = TBLRF
+c["VISC"] = b_He_IMP.magnitude    # Sutherland b  [lbf·s/(ft²·R^0.5)]
+c["VISM"] = S_He_IMP.magnitude    # Sutherland S  [R]
+c["SFOA"] = 0
+
+# Card 3 — key design parameters
+c["ETAD"]  = 60               # 60 = full radial flow (standard for M > 5)
+c["RC"]    = 6                # throat radius of curvature [× throat radius]; Sivells: 5.5–6.0
+c["FMACH"] = 0                # unused when ETAD = 60
+c["BMACH"] = 0.85 * dmach     # unused when ETAD = 60
+c["CMC"]   = dmach            # design Mach number
+c["SF"]    = throat_radius.magnitude   # throat radius [in]
+
+# Card 4 — solver grid  (Sivells AEDC-TR-78-63; reference: M6.5 example uses MT=61,LR=-45,NX=18)
+# Rules: MT/MD odd ≤ 125; ND ≤ 150; |LR| + NT ≤ 149
+c["MT"] = 101   # points on initial expansion characteristic CD
+c["NT"] = 61    # points on transonic axis IE         (45 + 61 = 106 ≤ 149)
+c["IX"] = 0     # 4th-degree velocity distribution    (recommended with ETAD=60)
+c["IN"] = 10    # downstream 2nd-derivative control   (Sivells recommends 10)
+c["IQ"] = 0     # 0 = complete contour
+c["MD"] = 101   # points on downstream characteristic AB
+c["ND"] = 121   # points on axis BC
+c["NF"] = -101  # points on characteristic EG (negative = downstream only)
+c["MP"] = 0
+c["MQ"] = 0
+c["JB"] = 1     # BL iterations before spline fit     (Sivells recommends 1)
+c["JX"] = 0     # spline fit after inviscid calc
+c["JC"] = 1
+c["IT"] = 0
+c["LR"] = -45   # throat characteristic points; negative prints transonic solution
+c["NX"] = 18    # logarithmic upstream spacing         (Sivells example value)
+
+# Card 6 — stagnation and heat transfer
+c["PPQ"]  = P0.magnitude    # stagnation pressure [psia]
+c["TO"]   = T0.magnitude    # stagnation temperature [R]
+c["TWT"]  = T_wall          # wall temperature [R]
+c["TWAT"] = T_wall          # water-cooling temp [R]
+
+# Card 7 — interpolation output range
+c["XLOW"] = XLOW
+c["XEND"] = XEND
+c["XINC"] = XINC
+
+
+# ── Run Contur ────────────────────────────────────────────────────────────────
+
+os.makedirs('inputcards', exist_ok=True)
+os.makedirs('outputs', exist_ok=True)
+
+c.print_to_input(file_name=f'm{dmach:.1f}.txt', output_directory='inputcards')
+
+ca  = ConturApplication(timeout=600)
+res = ca.batch_input_folder('inputcards', output_dir='outputs')  # type: ignore
+
+if not res:
+    raise RuntimeError(
+        "Contur produced no output. Check that contur.exe ran successfully "
+        "and that the input cards in 'inputcards/' are valid."
+    )
+
+output_dir = os.path.join('outputs', f'nozzle_M{dmach:.1f}_T{int(T0.magnitude)}R')
+save_all(res[0], output_dir)
+
+ExpansionCoords = res[0].SuperBetterCoordinates[1:]
+ExpansionCoords = np.concatenate(([[0, throat_radius.magnitude]], ExpansionCoords))
+
+
+# ── Contraction geometry (cubic Bézier) ──────────────────────────────────────
+
+node1 = (-contraction_length, pipe_width / 2)
+ctrl1 = (-contraction_length / 2, node1[1])
+node2 = (0, throat_radius.magnitude)
+ctrl2 = (-contraction_length / 2, node2[1])
+curve_points = cubic_bezier([node1, ctrl1, ctrl2, node2], num=125)
+
+
+# ── Derived quantities ────────────────────────────────────────────────────────
+
+print(f"Mass flow at throat: {mass_flow(radius=throat_radius, mach=1)}")
+
+
+# ── Write ANSYS contour file ──────────────────────────────────────────────────
+
+ansys_file = f'AutoContourM{dmach:.1f}.txt'
+
+write_ansys_points(ansys_file, [[-contraction_length, 0],
+                                 [-contraction_length, pipe_width / 2]], append=False)
+write_ansys_points(ansys_file, curve_points,    append=True)
+write_ansys_points(ansys_file, ExpansionCoords, append=True)
+write_ansys_points(ansys_file, [ExpansionCoords[-1], [XEND, 0]], append=True)
+write_ansys_points(ansys_file, [[XEND, 0], [-contraction_length, 0]], append=True)
