@@ -185,6 +185,8 @@ def write_ansys_points(filename, arr, append=False):
 
 # ── Gas properties ────────────────────────────────────────────────────────────
 
+P0 = (P0 * ureg.pascal).to('psi')
+T0 = (T0 * ureg.degK).to(ureg.degR)
 print(f"Mach: {dmach}")
 print(f"T0 = {T0:.4f}   P0 = {P0:.4f}")
 check_feasibility(T0.magnitude, P0.magnitude, dmach)
@@ -270,8 +272,8 @@ c["LR"] = -45   # throat characteristic points; negative prints transonic soluti
 c["NX"] = 18    # logarithmic upstream spacing         (Sivells example value)
 
 # Card 6 — stagnation and heat transfer
-c["PPQ"]  = (P0 * ureg.pascal).to('psi').magnitude              # stagnation pressure [psia]
-c["TO"]   = (T0 * ureg.degK).to(ureg.degR).magnitude            # stagnation temperature [R]
+c["PPQ"]  = P0.magnitude              # stagnation pressure [psia]
+c["TO"]   = T0.magnitude            # stagnation temperature [R]
 c["TWT"]  = (T_wall * ureg.degK).to(ureg.degR).magnitude        # wall temperature [R]
 c["TWAT"] = (T_wall * ureg.degK).to(ureg.degR).magnitude        # water-cooling temp [R]
 

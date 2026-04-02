@@ -1,0 +1,9 @@
+numpy
+scipy
+matplotlib
+pint
+CoolProp
+prettytable
+pygasflow
+notebook
+ipykernel
