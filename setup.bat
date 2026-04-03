@@ -79,14 +79,42 @@ if errorlevel 1 (
 echo        Done.
 echo.
 
-REM ── Install conturpy (local nozzle design library) ────────────
-echo [5/5] Installing conturpy (local nozzle design library) ...
+REM ── Clone and install conturpy ────────────────────────────────
+echo [5/5] Downloading and installing conturpy ...
+where git >nul 2>&1
+if errorlevel 1 (
+    echo.
+    echo ERROR: Git was not found on this computer.
+    echo.
+    echo Please install Git from:
+    echo     https://git-scm.com/downloads
+    echo.
+    echo Then re-run this script.
+    echo.
+    pause
+    exit /b 1
+)
+if exist conturpy (
+    echo        conturpy folder already exists, pulling latest changes ...
+    cd conturpy
+    git pull --quiet
+    cd ..
+) else (
+    git clone https://github.com/noahess/conturpy conturpy --quiet
+    if errorlevel 1 (
+        echo.
+        echo ERROR: Could not download conturpy.
+        echo        Check your internet connection and try again.
+        echo.
+        pause
+        exit /b 1
+    )
+)
 cd conturpy
 pip install -e . --quiet
 if errorlevel 1 (
     echo.
     echo ERROR: Could not install conturpy.
-    echo        Make sure the "conturpy" folder is inside the same folder as this script.
     echo.
     cd ..
     pause

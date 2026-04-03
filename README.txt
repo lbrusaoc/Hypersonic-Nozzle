@@ -93,7 +93,7 @@ Step 1 — Install Git
   2. Download and run the installer.
   3. Accept all defaults. When asked about the default editor,
      choose "Visual Studio Code" if it appears in the list.
-  4. When the installer finishes, open a NEW terminal and type:
+  4. When the installer finishes, open a NEW terminal (Win + R, type "cmd", press Enter) and type:
 
        git --version
 
